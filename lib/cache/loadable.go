@@ -2,9 +2,11 @@ package cache
 
 import (
 	"context"
-	"sync"
+	"fmt"
 
 	"github.com/eko/gocache/lib/v4/store"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -21,54 +23,46 @@ type LoadFunction[T any] func(ctx context.Context, key any) (T, error)
 
 // LoadableCache represents a cache that uses a function to load data
 type LoadableCache[T any] struct {
-	loadFunc   LoadFunction[T]
-	cache      CacheInterface[T]
-	setChannel chan *loadableKeyValue[T]
-	setterWg   *sync.WaitGroup
+	loadFunc  LoadFunction[T]
+	cache     CacheInterface[T]
+	loadGroup *singleflight.Group
 }
 
 // NewLoadable instanciates a new cache that uses a function to load data
 func NewLoadable[T any](loadFunc LoadFunction[T], cache CacheInterface[T]) *LoadableCache[T] {
-	loadable := &LoadableCache[T]{
-		loadFunc:   loadFunc,
-		cache:      cache,
-		setChannel: make(chan *loadableKeyValue[T], 10000),
-		setterWg:   &sync.WaitGroup{},
-	}
-
-	loadable.setterWg.Add(1)
-	go loadable.setter()
-
-	return loadable
-}
-
-func (c *LoadableCache[T]) setter() {
-	defer c.setterWg.Done()
-
-	for item := range c.setChannel {
-		c.Set(context.Background(), item.key, item.value)
+	return &LoadableCache[T]{
+		loadFunc:  loadFunc,
+		cache:     cache,
+		loadGroup: &singleflight.Group{},
 	}
 }
 
 // Get returns the object stored in cache if it exists
-func (c *LoadableCache[T]) Get(ctx context.Context, key any) (T, error) {
-	var err error
-
-	object, err := c.cache.Get(ctx, key)
+func (c *LoadableCache[T]) Get(ctx context.Context, key any) (object T, err error) {
+	object, err = c.cache.Get(ctx, key)
 	if err == nil {
 		return object, err
 	}
 
-	// Unable to find in cache, try to load it from load function
-	object, err = c.loadFunc(ctx, key)
-	if err != nil {
-		return object, err
-	}
+	loadData, err, _ := c.loadGroup.Do(fmt.Sprintf("%v", key), func() (interface{}, error) {
+		// Unable to find in cache, try to load it from load function
+		data, err := c.loadFunc(ctx, key)
+		if err != nil {
+			return data, err
+		}
 
-	// Then, put it back in cache
-	c.setChannel <- &loadableKeyValue[T]{key, object}
+		logrus.WithContext(ctx).WithField("data", data).Debugf("load data")
 
-	return object, err
+		// Then, put it back in cache
+		setErr := c.Set(ctx, key, data)
+		if setErr != nil {
+			logrus.WithContext(ctx).WithField("data", data).Debugf("load data")
+		}
+
+		return data, nil
+	})
+
+	return loadData.(T), err
 }
 
 // Set sets a value in available caches
@@ -97,8 +91,6 @@ func (c *LoadableCache[T]) GetType() string {
 }
 
 func (c *LoadableCache[T]) Close() error {
-	close(c.setChannel)
-	c.setterWg.Wait()
 
 	return nil
 }
